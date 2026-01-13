@@ -8,7 +8,7 @@
 
 This is a Model Context Protocol (MCP) server that provides access to the Elsevier Scopus API. It allows AI assistants to search for academic papers, retrieve abstracts, and look up author profiles.
 
-**Please note that requesting an Elsevier Scopus API key generally requires that your organization or institution has a subscription to Elsevier database services, and your device must have an uv development environment**
+**Please note that requesting an Elsevier Scopus API key generally requires that your organization or institution has a subscription to Elsevier database services, and your device must have a uv development environment**
 
 ## Configuration
 
