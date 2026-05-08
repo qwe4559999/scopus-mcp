@@ -1,11 +1,23 @@
 import json
 import hashlib
 import time
+import os
 from pathlib import Path
 from typing import Optional, Dict, Any, Union
 
+
+def _default_cache_dir() -> Path:
+    if os.name == 'nt':
+        base = Path(os.environ.get('LOCALAPPDATA', Path.home() / 'AppData' / 'Local'))
+    else:
+        base = Path(os.environ.get('XDG_CACHE_HOME', Path.home() / '.cache'))
+    return base / 'scopus-mcp'
+
+
 class CacheManager:
-    def __init__(self, cache_dir: Union[str, Path] = ".cache", expiration_seconds: int = 86400):
+    def __init__(self, cache_dir: Union[str, Path] = None, expiration_seconds: int = 86400):
+        if cache_dir is None:
+            cache_dir = _default_cache_dir()
         self.cache_dir = Path(cache_dir).resolve()
         self.expiration_seconds = expiration_seconds
         self.cache_dir.mkdir(parents=True, exist_ok=True)
