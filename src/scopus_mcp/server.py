@@ -121,34 +121,34 @@ async def handle_call_tool(
             query = arguments.get("query")
             count = arguments.get("count", 5)
             sort = arguments.get("sort", "coverDate")
-            
+
             if not query:
                 raise ValueError("Query is required")
 
             # Await the async client method
             raw_data = await client.search_scopus(query, count=count, sort=sort)
             results = clean_search_results(raw_data)
-            
+
             return [types.TextContent(type="text", text=str(results))]
 
         elif name == "get_abstract_details":
             scopus_id = arguments.get("scopus_id")
             if not scopus_id:
                 raise ValueError("scopus_id is required")
-                
+
             raw_data = await client.get_abstract(scopus_id)
             details = clean_abstract_details(raw_data)
-            
+
             return [types.TextContent(type="text", text=str(details))]
 
         elif name == "get_author_profile":
             author_id = arguments.get("author_id")
             if not author_id:
                 raise ValueError("author_id is required")
-                
+
             raw_data = await client.get_author(author_id)
             profile = clean_author_profile(raw_data)
-            
+
             return [types.TextContent(type="text", text=str(profile))]
 
         elif name == "get_citing_papers":
@@ -159,9 +159,12 @@ async def handle_call_tool(
             if not scopus_id:
                 raise ValueError("scopus_id is required")
 
-            # Clean ID and construct REFEID query
-            clean_id = scopus_id.replace('SCOPUS_ID:', '')
-            query = f"REFEID({clean_id})"
+            # Forward citations: find documents whose reference list contains
+            # this document's EID. Scopus needs REF(<eid>) in the 2-s2.0 form.
+            # REFEID(<bare id>) returns HTTP 400.
+            clean_id = scopus_id.replace('SCOPUS_ID:', '').replace('2-s2.0-', '').strip()
+            eid = f"2-s2.0-{clean_id}"
+            query = f"REF({eid})"
 
             raw_data = await client.search_scopus(query, count=count, sort=sort)
             results = clean_search_results(raw_data)
@@ -172,7 +175,7 @@ async def handle_call_tool(
             quota = await client.get_quota_status()
             if not quota:
                 return [types.TextContent(type="text", text="No quota information available yet. Please make a request to initialize.")]
-            
+
             return [types.TextContent(type="text", text=str(quota))]
 
         else:
