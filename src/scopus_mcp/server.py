@@ -120,6 +120,23 @@ async def handle_list_tools() -> list[types.Tool]:
             }
         ),
         types.Tool(
+            name="diagnose_connection",
+            description=(
+                "Diagnose Scopus connectivity and entitlement. Runs four checks "
+                "(config presence, api.elsevier.com reachability, metadata "
+                "entitlement, search entitlement) and returns a JSON report with "
+                "a one-line verdict. Run this first when Scopus behaves strangely "
+                "— especially when valid searches fail with 'Error translating "
+                "query', which usually means missing subscriber entitlement "
+                "(off-network without SCOPUS_INSTTOKEN), not bad query syntax."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        ),
+        types.Tool(
             name="get_quota_status",
             description="Get the current API quota status (remaining/limit). Note: Values are updated only after making a request.",
             inputSchema={
@@ -950,6 +967,11 @@ async def handle_call_tool(
 
             import json as _json
             return [types.TextContent(type="text", text=_json.dumps(summary, ensure_ascii=False, indent=2))]
+
+        elif name == "diagnose_connection":
+            report = await client.diagnose_connection()
+            import json as _json
+            return [types.TextContent(type="text", text=_json.dumps(report, indent=2))]
 
         elif name == "get_quota_status":
             quota = await client.get_quota_status()

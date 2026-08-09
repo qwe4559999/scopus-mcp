@@ -1,11 +1,19 @@
 import logging
 import asyncio
 import math
+import random
+import time
 import httpx
 from typing import Optional, Dict, Any
 from urllib.parse import urljoin
 
-from .config import get_api_key, get_cache_config, get_insttoken, get_page_size
+from .config import (
+    get_api_key,
+    get_cache_config,
+    get_insttoken,
+    get_max_retries,
+    get_page_size,
+)
 from .cache import CacheManager
 from .utils import to_scopus_id, to_eid
 
@@ -14,6 +22,28 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://api.elsevier.com/"
+
+# Elsevier's misleading off-network failure: the Search API rejects every
+# query (even trivially valid ones) with this 400 when the key authenticates
+# but lacks subscriber entitlement (no institutional IP and no insttoken).
+ENTITLEMENT_400_STATUS_TEXT = "Error translating query"
+ENTITLEMENT_NOTE = (
+    " Note: if your query is valid Scopus syntax, this error usually means "
+    "the request lacks subscriber entitlement. Off-network access requires "
+    "the institutional VPN or SCOPUS_INSTTOKEN."
+)
+
+# Transport failures worth retrying; other request errors are deterministic.
+RETRYABLE_TRANSPORT_ERRORS = (
+    httpx.ConnectTimeout,
+    httpx.ReadTimeout,
+    httpx.ConnectError,
+    httpx.RemoteProtocolError,
+)
+
+# Stable, existing record used by diagnose_connection as a metadata canary.
+CANARY_SCOPUS_ID = "85007305299"
+CANARY_QUERY = "ALL(gene)"
 
 class ScopusClient:
     """
@@ -26,13 +56,20 @@ class ScopusClient:
         # Per-request page size for search_all; 25 by default (see get_page_size).
         self.page_size = get_page_size()
         insttoken = get_insttoken()
+        self.max_retries = get_max_retries()
         self.headers = {
             'X-ELS-APIKey': self.api_key,
             'Accept': 'application/json',
-            'User-Agent': 'ScopusMCP/0.7.0',
+            'User-Agent': 'ScopusMCP/0.8.0',
         }
         if insttoken:
             self.headers['X-ELS-Insttoken'] = insttoken
+            logger.info("Scopus client ready (insttoken: configured)")
+        else:
+            logger.info(
+                "Scopus client ready (insttoken: not set, subscriber "
+                "features require institutional network)"
+            )
         # Initialize CacheManager with default expiration
         self.cache = CacheManager(expiration_seconds=self.cache_config['default'])
         self.client = httpx.AsyncClient(
@@ -63,34 +100,63 @@ class ScopusClient:
                 logger.debug(f"Cache hit for {url}")
                 return cached
 
-        retries = 3
-        backoff = 1
+        # Retries apply to GET only (all Scopus endpoints here are GET);
+        # POSTs would not be safe to replay.
+        can_retry = method.upper() == 'GET'
+        attempt = 1
+        max_attempts = (1 + self.max_retries) if can_retry else 1
 
-        while retries > 0:
+        while True:
             try:
                 response = await self.client.request(method, url, params=params)
-                
-                # Update Quota Info from Headers
-                self._update_quota_info(response.headers)
-                
-                # Handle Rate Limiting
-                if response.status_code == 429:
-                    if retries <= 1:
-                        quota_snap = {k: response.headers.get(k, '') for k in (
-                            'X-RateLimit-Remaining', 'X-RateLimit-Reset', 'X-ELS-Status')}
-                        raise Exception(
-                            f"Rate limit exceeded (429) after retries. "
-                            f"Quota headers: {quota_snap}"
-                        )
-                    import time
-                    reset_time = int(response.headers.get('X-RateLimit-Reset', 0))
-                    sleep_time = max(reset_time - time.time(), backoff)
-                    logger.warning(f"Rate limit exceeded. Retrying in {sleep_time:.1f}s...")
-                    await asyncio.sleep(sleep_time)
-                    retries -= 1
-                    backoff *= 2
-                    continue
+            except RETRYABLE_TRANSPORT_ERRORS as e:
+                if attempt >= max_attempts:
+                    raise Exception(
+                        f"Network error contacting Scopus API for {endpoint} "
+                        f"after {attempt} attempt(s): {type(e).__name__}: {e}"
+                    ) from e
+                delay = self._backoff_delay(attempt)
+                # Log endpoint only — the query string can be long and noisy.
+                logger.info(
+                    f"Retrying {endpoint} (attempt {attempt + 1}/{max_attempts}) "
+                    f"after {type(e).__name__}; sleeping {delay:.1f}s"
+                )
+                await asyncio.sleep(delay)
+                attempt += 1
+                continue
+            except httpx.RequestError as e:
+                raise Exception(f"Request to Scopus API failed for {endpoint}: {e}") from e
 
+            # Update Quota Info from Headers
+            self._update_quota_info(response.headers)
+
+            status = response.status_code
+            if status == 429 or 500 <= status < 600:
+                if attempt < max_attempts:
+                    if status == 429:
+                        delay = self._retry_after_delay(response.headers) or self._backoff_delay(attempt)
+                    else:
+                        delay = self._backoff_delay(attempt)
+                    logger.info(
+                        f"Retrying {endpoint} (attempt {attempt + 1}/{max_attempts}) "
+                        f"after HTTP {status}; sleeping {delay:.1f}s"
+                    )
+                    await asyncio.sleep(delay)
+                    attempt += 1
+                    continue
+                if status == 429:
+                    quota_snap = {k: response.headers.get(k, '') for k in (
+                        'X-RateLimit-Remaining', 'X-RateLimit-Reset', 'X-ELS-Status')}
+                    raise Exception(
+                        f"Rate limit exceeded (429) after retries. "
+                        f"Quota headers: {quota_snap}"
+                    )
+                raise Exception(
+                    f"Scopus API server error {status} for {endpoint} "
+                    f"after {attempt} attempt(s)"
+                )
+
+            try:
                 response.raise_for_status()
                 data = response.json()
 
@@ -101,17 +167,8 @@ class ScopusClient:
                 return data
 
             except httpx.HTTPStatusError as e:
-                # Update quota info even on error if headers exist
-                if e.response:
-                    self._update_quota_info(e.response.headers)
-                    
                 status = e.response.status_code
-                if status in [500, 502, 503, 504]:
-                    logger.warning(f"Server error {status}. Retrying in {backoff}s...")
-                    await asyncio.sleep(backoff)
-                    retries -= 1
-                    backoff *= 2
-                elif status == 401:
+                if status == 401:
                     logger.error("Authentication failed. Check your API key.")
                     is_ref = params is not None and params.get('view') == 'REF'
                     quota_snap = {k: e.response.headers.get(k, '') for k in (
@@ -142,20 +199,44 @@ class ScopusClient:
                     except Exception:
                         pass
                     q = params.get('query') if params else None
-                    raise Exception(
+                    msg = (
                         f"Scopus API error {status} for {url} "
                         f"(query={q!r}): {body}"
-                    ) from e
-            except httpx.RequestError as e:
-                logger.warning(f"Request failed: {e}. Retrying...")
-                await asyncio.sleep(backoff)
-                retries -= 1
-                backoff *= 2
+                    )
+                    if status == 400 and self._is_entitlement_400(e.response):
+                        msg += ENTITLEMENT_NOTE
+                    raise Exception(msg) from e
             except ValueError:
                 logger.error("Failed to parse JSON response")
                 raise Exception("Invalid JSON response from Scopus API")
 
-        raise Exception(f"Max retries exceeded for {url}")
+    @staticmethod
+    def _is_entitlement_400(response: httpx.Response) -> bool:
+        """True when a 400 body carries Elsevier's translating-query signature.
+
+        Off-network (unentitled) keys get this exact error for every search
+        query, valid or not, so it cannot be trusted as a syntax error alone.
+        """
+        try:
+            status = response.json().get('service-error', {}).get('status', {})
+            return status.get('statusText') == ENTITLEMENT_400_STATUS_TEXT
+        except Exception:
+            return False
+
+    def _backoff_delay(self, attempt: int) -> float:
+        """Exponential backoff with full jitter: uniform(0, 1s * 2^(attempt-1))."""
+        return random.uniform(0, 2 ** (attempt - 1))
+
+    @staticmethod
+    def _retry_after_delay(headers: httpx.Headers) -> Optional[float]:
+        """Parses a numeric Retry-After header, capped at 10 s."""
+        raw = headers.get('Retry-After')
+        if raw is None:
+            return None
+        try:
+            return min(max(float(raw), 0.0), 10.0)
+        except (TypeError, ValueError):
+            return None
 
     def _update_quota_info(self, headers: httpx.Headers):
         """Updates internal quota state from response headers."""
@@ -396,6 +477,127 @@ class ScopusClient:
                 logger.info(f"ScienceDirect fulltext not entitled for doi={doi}: {exc}")
                 return None
             raise
+
+    async def diagnose_connection(self) -> Dict[str, Any]:
+        """
+        Runs four ordered health checks (config, reachability, metadata
+        entitlement, search entitlement) and returns a structured report
+        with a one-line verdict.  Never reports credential values.
+        """
+        report: Dict[str, Any] = {}
+
+        # 1. Config (no network): presence only, never values.
+        try:
+            get_api_key()
+            api_key_present = True
+        except ValueError:
+            api_key_present = False
+        report['config'] = {
+            'api_key_present': api_key_present,
+            'insttoken_present': bool(get_insttoken()),
+        }
+
+        # 2. Reachability: any HTTP status counts as reachable; only
+        # transport errors/timeouts do not.
+        reachability: Dict[str, Any] = {
+            'reachable': False,
+            'connect_seconds': None,
+            'total_seconds': None,
+        }
+        try:
+            start = time.monotonic()
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection('api.elsevier.com', 443), timeout=8.0
+            )
+            reachability['connect_seconds'] = round(time.monotonic() - start, 3)
+            writer.close()
+        except Exception:
+            pass
+        try:
+            start = time.monotonic()
+            await self.client.get(BASE_URL, timeout=8.0)
+            reachability['total_seconds'] = round(time.monotonic() - start, 3)
+            reachability['reachable'] = True
+        except Exception as exc:
+            reachability['error'] = type(exc).__name__
+        report['reachability'] = reachability
+
+        # 3. Metadata entitlement: canary abstract via the existing code path.
+        metadata: Dict[str, Any] = {'status': 'ok', 'canary_id': CANARY_SCOPUS_ID}
+        try:
+            await self._request(
+                'GET',
+                f'content/abstract/scopus_id/{CANARY_SCOPUS_ID}',
+                use_cache=False,
+            )
+        except Exception as exc:
+            msg = str(exc)
+            if any(m in msg for m in ('401', '403', 'Authentication failed')):
+                metadata['status'] = 'auth_failed'
+            else:
+                metadata['status'] = 'error'
+            metadata['detail'] = msg[:300]
+        report['metadata'] = metadata
+
+        # 4. Search entitlement: canary query via the existing search path.
+        search: Dict[str, Any] = {'status': 'ok', 'canary_query': CANARY_QUERY}
+        try:
+            await self._request(
+                'GET',
+                'content/search/scopus',
+                {'query': CANARY_QUERY, 'count': 1, 'start': 0,
+                 'sort': 'coverDate', 'view': 'STANDARD'},
+                use_cache=False,
+            )
+        except Exception as exc:
+            msg = str(exc)
+            if ENTITLEMENT_400_STATUS_TEXT in msg:
+                search['status'] = 'entitlement_missing'
+            elif any(m in msg for m in ('401', '403', 'Authentication failed')):
+                search['status'] = 'auth_failed'
+            elif 'Network error' in msg or 'Timeout' in msg or 'timed out' in msg:
+                search['status'] = 'network'
+            else:
+                search['status'] = 'error'
+            search['detail'] = msg[:300]
+        report['search'] = search
+
+        report['verdict'] = self._build_verdict(report)
+        return report
+
+    @staticmethod
+    def _build_verdict(report: Dict[str, Any]) -> str:
+        """Collapses the four checks into a one-line, user-relayable verdict."""
+        metadata = report['metadata']['status']
+        search = report['search']['status']
+        reachability = report['reachability']
+
+        if 'auth_failed' in (metadata, search):
+            verdict = "API key rejected; check SCOPUS_API_KEY."
+        elif search == 'entitlement_missing' and metadata == 'ok':
+            verdict = (
+                "API key authenticates but Scopus Search lacks subscriber "
+                "entitlement. You are likely off your institution's network. "
+                "Connect the institutional VPN or set SCOPUS_INSTTOKEN "
+                "(request an institutional token from Elsevier developer support)."
+            )
+        elif metadata == 'ok' and search == 'ok':
+            verdict = "Connection and entitlement healthy."
+        elif not reachability['reachable'] or search == 'network':
+            verdict = "api.elsevier.com is not reachable; check your network connection."
+        else:
+            verdict = (
+                "One or more checks failed for an unrecognized reason; "
+                "see per-check details."
+            )
+
+        connect = reachability.get('connect_seconds')
+        if reachability['reachable'] and (connect is None or connect > 2.0):
+            verdict += (
+                " Network path to api.elsevier.com is degraded; retries "
+                "are enabled but expect failures."
+            )
+        return verdict
 
     async def get_citing_papers(self, scopus_id: str, count: int = 25, start: int = 0, sort: str = 'coverDate') -> Dict[str, Any]:
         """

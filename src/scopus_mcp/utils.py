@@ -114,7 +114,7 @@ async def fetch_oa_fulltext(doi: str) -> Dict[str, Any]:
     Never raises; failures are logged and surfaced as text=None.
     """
     POLITE_HEADERS = {
-        'User-Agent': 'ScopusMCP/0.7.0 (mailto:hron@hey.com)',
+        'User-Agent': 'ScopusMCP/0.8.0 (mailto:hron@hey.com)',
         'Accept': '*/*',
     }
 

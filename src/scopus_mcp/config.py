@@ -87,6 +87,25 @@ def get_page_size() -> int:
     return max(1, min(size, MAX_PAGE_SIZE))
 
 
+def get_max_retries() -> int:
+    """
+    Retrieves the maximum retry count for transient request failures:
+    1. Environment variable 'SCOPUS_MAX_RETRIES'
+    2. config.json 'max_retries' field
+    Defaults to 2 (3 attempts total); 0 disables retries.
+    """
+    raw = os.getenv('SCOPUS_MAX_RETRIES')
+    if raw is None:
+        config = load_config_file()
+        raw = config.get('max_retries')
+    if raw is None:
+        return 2
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 2
+
+
 def get_cache_config() -> Dict[str, int]:
     """
     Retrieves cache expiration settings from env vars or config.json.
