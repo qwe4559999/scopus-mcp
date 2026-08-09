@@ -1,10 +1,11 @@
 import logging
 import asyncio
+import math
 import httpx
 from typing import Optional, Dict, Any
 from urllib.parse import urljoin
 
-from .config import get_api_key, get_cache_config, get_insttoken
+from .config import get_api_key, get_cache_config, get_insttoken, get_page_size
 from .cache import CacheManager
 from .utils import to_scopus_id, to_eid
 
@@ -22,6 +23,8 @@ class ScopusClient:
     def __init__(self):
         self.api_key = get_api_key()
         self.cache_config = get_cache_config()
+        # Per-request page size for search_all; 25 by default (see get_page_size).
+        self.page_size = get_page_size()
         insttoken = get_insttoken()
         self.headers = {
             'X-ELS-APIKey': self.api_key,
@@ -236,13 +239,19 @@ class ScopusClient:
         """
         Pages through a Scopus search and returns aggregated results up to max_results.
 
-        Uses start-based paging (page size 200, ceiling 5,000) when max_results <= 5,000.
-        Switches to cursor=* deep paging when max_results > 5,000 — the two modes are
-        mutually exclusive per Scopus API rules.  Deduplicates across pages by dc:identifier.
+        Uses start-based paging (ceiling 5,000) when max_results <= 5,000.  Switches to
+        cursor=* deep paging when max_results > 5,000 — the two modes are mutually
+        exclusive per Scopus API rules.  Deduplicates across pages by dc:identifier.
+
+        Page size is self.page_size — 25 by default, the per-request 'count' ceiling for
+        non-institutional keys; see config.get_page_size for raising it.
+
+        Paging is guaranteed to terminate: each loop stops on an empty page, a short
+        page, a page that adds no new identifiers, a cursor that fails to advance, or
+        a hard page cap.  Without those guards a misbehaving API — one returning a full
+        batch alongside an unchanging @next cursor — would spin forever.
         """
-        # 25 is the max count per page for non-institutional API keys.
-        # Institutional keys support up to 200, but 25 is safe for all tiers.
-        PAGE_SIZE = 25
+        page_size = max(1, int(self.page_size))
         CURSOR_CEILING = 5000
 
         all_entries: list = []
@@ -250,12 +259,24 @@ class ScopusClient:
         total_available: int = 0
         note: Optional[str] = None
 
+        # Backstop for pathological paging.  Honest paging needs at most
+        # ceil(max_results / page_size) requests; double that plus slack so
+        # duplicate-heavy result sets still page through normally, and treat
+        # anything beyond it as the API failing to make progress.
+        max_pages = math.ceil(max_results / page_size) * 2 + 10
+        pages = 0
+        hit_page_cap = False
+
         use_cursor = max_results > CURSOR_CEILING
 
         if use_cursor:
             cursor: str = '*'
             while len(all_entries) < max_results:
-                batch = min(PAGE_SIZE, max_results - len(all_entries))
+                if pages >= max_pages:
+                    hit_page_cap = True
+                    break
+                pages += 1
+                batch = min(page_size, max_results - len(all_entries))
                 params: Dict[str, Any] = {
                     'query': query,
                     'count': batch,
@@ -276,21 +297,36 @@ class ScopusClient:
                 entries = sr.get('entry', [])
                 if not entries:
                     break
+                added = 0
                 for e in entries:
                     uid = e.get('dc:identifier') or e.get('eid') or ''
                     if uid not in seen_ids:
                         seen_ids.add(uid)
                         all_entries.append(e)
-                next_cursor = sr.get('cursor', {}).get('@next')
+                        added += 1
+                next_cursor = (sr.get('cursor') or {}).get('@next')
                 if not next_cursor:
                     break
                 if len(entries) < batch:
                     break  # API returned fewer than requested — results exhausted
+                if next_cursor == cursor:
+                    # The cursor has stopped advancing: following it again would
+                    # re-fetch this exact page forever.
+                    logger.warning(
+                        f"Deep paging stopped: @next cursor did not advance past {cursor!r}."
+                    )
+                    break
+                if added == 0:
+                    break  # Page contained only records already seen
                 cursor = next_cursor
         else:
             start = 0
             while len(all_entries) < max_results and start < CURSOR_CEILING:
-                batch = min(PAGE_SIZE, max_results - len(all_entries), CURSOR_CEILING - start)
+                if pages >= max_pages:
+                    hit_page_cap = True
+                    break
+                pages += 1
+                batch = min(page_size, max_results - len(all_entries), CURSOR_CEILING - start)
                 data = await self.search_scopus(query, count=batch, start=start, sort=sort)
                 sr = data.get('search-results', {})
                 if not total_available:
@@ -319,6 +355,14 @@ class ScopusClient:
                 f"Result set capped: fetched {fetched} of {total_available} total "
                 f"(max_results={max_results})."
             )
+        if hit_page_cap:
+            cap_note = (
+                f"Paging stopped at the {max_pages}-page safety cap without reaching "
+                f"max_results={max_results}: the API kept returning pages that added "
+                f"few or no new records."
+            )
+            logger.warning(cap_note)
+            note = f"{note} {cap_note}" if note else cap_note
 
         return {
             'search-results': {'entry': all_entries},
@@ -326,6 +370,8 @@ class ScopusClient:
                 'total_fetched': fetched,
                 'total_available': total_available,
                 'truncated': truncated,
+                'pages_fetched': pages,
+                'hit_page_cap': hit_page_cap,
                 'note': note,
             },
         }

@@ -58,6 +58,35 @@ def get_insttoken() -> Optional[str]:
     return config.get('insttoken') or None
 
 
+DEFAULT_PAGE_SIZE = 25
+MAX_PAGE_SIZE = 200
+
+
+def get_page_size() -> int:
+    """
+    Retrieves the per-request page size used by ScopusClient.search_all:
+    1. Environment variable 'SCOPUS_PAGE_SIZE'
+    2. config.json 'page_size' field
+    3. Default 25
+
+    25 is the 'count' ceiling for non-institutional Scopus keys — asking for
+    more returns 400 INVALID_INPUT.  Institutional (subscriber) keys accept up
+    to 200, which cuts request count, and therefore quota burn, by 8x.  That
+    entitlement cannot be detected from the key or from the presence of an
+    insttoken, so raising the page size is an explicit opt-in.
+
+    Non-numeric values fall back to the default; numeric values are clamped to
+    1..200.
+    """
+    config = load_config_file()
+    raw = os.getenv('SCOPUS_PAGE_SIZE', config.get('page_size', DEFAULT_PAGE_SIZE))
+    try:
+        size = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_PAGE_SIZE
+    return max(1, min(size, MAX_PAGE_SIZE))
+
+
 def get_cache_config() -> Dict[str, int]:
     """
     Retrieves cache expiration settings from env vars or config.json.
