@@ -44,6 +44,68 @@ def get_api_key() -> str:
         
     return api_key
 
+def get_insttoken() -> Optional[str]:
+    """
+    Retrieves the optional institutional token with the following precedence:
+    1. Environment variable 'SCOPUS_INSTTOKEN'
+    2. config.json 'insttoken' field
+    Returns None when not configured.
+    """
+    token = os.getenv('SCOPUS_INSTTOKEN')
+    if token:
+        return token
+    config = load_config_file()
+    return config.get('insttoken') or None
+
+
+DEFAULT_PAGE_SIZE = 25
+MAX_PAGE_SIZE = 200
+
+
+def get_page_size() -> int:
+    """
+    Retrieves the per-request page size used by ScopusClient.search_all:
+    1. Environment variable 'SCOPUS_PAGE_SIZE'
+    2. config.json 'page_size' field
+    3. Default 25
+
+    25 is the 'count' ceiling for non-institutional Scopus keys — asking for
+    more returns 400 INVALID_INPUT.  Institutional (subscriber) keys accept up
+    to 200, which cuts request count, and therefore quota burn, by 8x.  That
+    entitlement cannot be detected from the key or from the presence of an
+    insttoken, so raising the page size is an explicit opt-in.
+
+    Non-numeric values fall back to the default; numeric values are clamped to
+    1..200.
+    """
+    config = load_config_file()
+    raw = os.getenv('SCOPUS_PAGE_SIZE', config.get('page_size', DEFAULT_PAGE_SIZE))
+    try:
+        size = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_PAGE_SIZE
+    return max(1, min(size, MAX_PAGE_SIZE))
+
+
+def get_max_retries() -> int:
+    """
+    Retrieves the maximum retry count for transient request failures:
+    1. Environment variable 'SCOPUS_MAX_RETRIES'
+    2. config.json 'max_retries' field
+    Defaults to 2 (3 attempts total); 0 disables retries.
+    """
+    raw = os.getenv('SCOPUS_MAX_RETRIES')
+    if raw is None:
+        config = load_config_file()
+        raw = config.get('max_retries')
+    if raw is None:
+        return 2
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 2
+
+
 def get_cache_config() -> Dict[str, int]:
     """
     Retrieves cache expiration settings from env vars or config.json.
